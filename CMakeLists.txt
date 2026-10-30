@@ -9,6 +9,11 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.44.1 LANGUAGES CXX)
+
+option(STRATA_ENABLE_KV_MEMORY "Experimental single-GPU CUDA KV memory interfaces and diagnostics" OFF)
+if(STRATA_ENABLE_KV_MEMORY AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL OR STRATA_HIP_GFX906))
+  message(FATAL_ERROR "STRATA_ENABLE_KV_MEMORY is a CUDA-only experimental overlay")
+endif()
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -1930,3 +1935,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/cmake/glm.cmake OPTIONAL)
 # the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON) and does nothing until the
 # port's own sources are in tools/m31/, so a default configure is unchanged
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/m31.cmake OPTIONAL)
+
+# Optional experimental overlay. OFF leaves all existing engine sources unchanged.
+if(STRATA_ENABLE_KV_MEMORY)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/kv_memory.cmake)
+endif()

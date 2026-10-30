@@ -7096,6 +7096,15 @@ def main() -> int:
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = read_config(a.config) if a.config else {}
+    _memory_adapter = None
+    if (cfg.get("memory_gateway") or {}).get("enabled"):
+        import importlib.util as _memory_import
+        _memory_path = cfg["memory_gateway"].get("adapter_path") or str(Path(__file__).resolve().parent / "kv_memory" / "kv_live.py")
+        _memory_spec = _memory_import.spec_from_file_location("_strata_memory_gateway", _memory_path)
+        _memory_adapter = _memory_import.module_from_spec(_memory_spec)
+        _memory_spec.loader.exec_module(_memory_adapter)
+        _memory_adapter.configure(cfg, sys.modules[__name__])
+
     split_joined_args(cfg)
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
@@ -7364,6 +7373,8 @@ def main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    if _memory_adapter is not None:
+        svc.memory_gateway = _memory_adapter.install(svc, cfg["memory_gateway"], sys.modules[__name__])
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision

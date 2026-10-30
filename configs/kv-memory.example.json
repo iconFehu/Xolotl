@@ -1,0 +1,30 @@
+{
+  "memory_gateway": {
+    "enabled": true,
+    "test_environment": true,
+    "root": "/absolute/private/path/kv-memory-data",
+    "namespace": "replace-with-engine-template-and-argument-version-digest",
+    "port": 20981,
+    "disk_budget_bytes": 8589934592,
+    "max_save_tokens": 65536,
+    "normal": "low",
+    "summary": "off"
+  },
+  "env": {
+    "STRATA_MEMORY_API_V1": "1",
+    "STRATA_QSA_BLOCK_PROTO": "1",
+    "STRATA_QSA_V7_RESET": "1",
+    "STRATA_QSA_V2_VALIDITY": "1",
+    "STRATA_QSA_V2_FIXED_MTP": "4",
+    "STRATA_QSA_V2_RESUME": "1",
+    "STRATA_QSA_V15_GEOMETRY": "1",
+    "STRATA_QSA_V18_PERSIST": "1",
+    "STRATA_QSA_V22_COMPACT": "1",
+    "STRATA_QSA_V24_MODE": "1",
+    "STRATA_QSA_V28_HOT_RESET": "1",
+    "STRATA_QSA_V2_MAIN_HASH": "1",
+    "STRATA_QSA_V3_FAST": "1",
+    "STRATA_QSA_V5_COMPACT": "1",
+    "STRATA_QSA_V53_PREFIX_REPLAY": "1"
+  }
+}
