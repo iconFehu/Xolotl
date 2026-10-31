@@ -78,10 +78,14 @@ with tempfile.TemporaryDirectory(prefix='kv-live-cpu-') as t:
  old_run=c.original_run;old_audit=c.audit;passes=[];engine.restart=lambda:None
  def simulated_run(*args,**kwargs):
   passes.append(1);yield ('content','BAD_BUFFERED' if len(passes)==1 else 'GOOD_COLD_RETRY')
- def rejected_audit():raise RuntimeError('MTP_ACTIVE_VALIDITY')
+ audits=[]
+ def rejected_audit():
+  audits.append(1)
+  if len(audits)==1:raise RuntimeError('MTP_ACTIVE_VALIDITY')
+  return old_audit()
  c.original_run=simulated_run;c.audit=rejected_audit
  released=list(svc.run(altered,True,[],8192,{},threading.Event()))
- assert released==[('content','GOOD_COLD_RETRY')] and c.warm_text is None
+ assert released==[('content','GOOD_COLD_RETRY')] and c.warm_text is None and len(audits)==2
  c.original_run=old_run;c.audit=old_audit
  assert pipe.owner is None
  httpd.shutdown();httpd.server_close();c.httpd.shutdown();c.httpd.server_close()

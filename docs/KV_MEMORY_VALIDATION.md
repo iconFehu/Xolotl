@@ -50,3 +50,41 @@ HIP, SYCL, multi-GPU, other models/quantizations, Linux hardware, strict cold/wa
 bitwise model parity, a 512K full-window accuracy sweep and long-duration numerical
 stability were not validated for this source export. The overlay is CUDA-only and
 off by default; it is not an upstream-ready cross-backend certification.
+
+## EOF-handling follow-up (2026-10-30)
+
+Only Python adapter code changed; the server hook and native executable stayed
+unchanged. The following feature tests passed on Windows/Python 3.11:
+
+- `tools/test_kv_memory.py`: ordinary HTTP, transaction fencing, text/image
+  invalidation, cancellation, discarded bad warm output and an audited retry.
+- `tools/test_kv_memory_failures.py`: a real child exiting with code 37,
+  classified fatal stdout, cancellation reason/deduplication, bounded audited
+  retry, double failure withholding output, no replay after publication, and
+  actual HTTP/SSE error responses in three protocol dialects.
+- `tools/test_kv_memory_images.py`: 17 image identity scenarios and five malformed
+  layouts. `tools/test_kv_memory_default.py`: no adapter import/engine replacement
+  for absent, null, empty or disabled configuration.
+
+An isolated GPU fixture used the **already deployed native candidate**, not the
+rebased fork executable: SC117 IQ3_XXS, 524288 context, 8192 output limit, Low,
+fixed mapping/MTP window and vision. Six requests covered priming, a deliberately
+killed native process with verified complete-text retry, re-priming, repeated
+failure with explicit SSE error/no model output, next-request recovery and actual
+socket cancellation. Write/flush failure now records `QBDIAG`, native run/PID and
+exit code 1; this exit code belongs to injected termination, not the historical
+unexplained failure.
+
+Cancellation skipped audit and automatic retry, but the fixture's `MEM_END`
+also encountered EOF and discarded the backend. This is recorded as a failed
+transaction, not evidence that the native engine survives every cancellation.
+The underlying historical native-exit cause cannot be reconstructed from the
+old logs; it is not attributed to OOM or client cancellation without evidence.
+
+The first local trial failed a diagnostic-coverage check for write/flush EOF
+and automatically restored the prior version. The second trial included that
+classifier and passed the failure semantics above. Subsequent live/public
+models, text/image generation, resident text/image SSE reuse and Summary Off
+probes passed, with native state/MTP audits and protected-file hashes checked.
+No fault-injection module or test-only control endpoint is installed in the
+live adapter. These checks do not replace long-duration stability testing.

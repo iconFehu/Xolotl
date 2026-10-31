@@ -159,3 +159,36 @@ are recorded separately in `KV_MEMORY_VALIDATION.md`. No HIP/SYCL, arbitrary
 model, 512K full-window accuracy, all-branch caching, unlimited memory or
 long-duration correctness guarantee is claimed. Desktop DSH AgentLoop integration
 remains separate; this feature hooks the API path used by existing clients.
+
+## Native EOF, cancellation and streaming failures
+
+The opt-in adapter records each native process UUID/PID, executable hash, stdout
+EOF, exit code (decimal and unsigned hexadecimal), server-requested termination,
+and classified verifier failures. Verifier stdout is hashed, never copied into
+the public journal. `native_exit` can arrive after `native_stdout_eof`; correlate
+both by `native_run`, rather than assuming EOF means the OS already reaped it.
+An unexplained exit remains `native_exit_or_external_termination`; it is not
+labelled an out-of-memory event without evidence.
+
+`kv_control_failed` includes the operation and distinguishes write/flush EOF
+from a read EOF. `request_cancelled` records the request ID and whether the
+client disconnected or a caller cancelled it. Cancelled generations discard
+resident proofs, skip the post-generation audit, and never launch an automatic
+retry. Warm buffered generations forward progress heartbeats while withholding
+all model output until the state audit passes.
+
+A failed text reuse/restore may retry **once**, with a fresh native process and
+the complete text history, only if the client is still connected and no model
+output has been published. The retry is buffered and audited too. A failed
+retry emits an explicit API error, not a successful empty answer. Image errors
+fail closed to a fresh client request: the original generation may have consumed
+its GENI embedding file, so an automatic replay using that file is unsafe.
+
+`sse_failed`, `sse_write_failed` and `http_end.outcome` distinguish application
+failure/cancellation from successful delivery. HTTP 200 alone is not a success
+criterion once SSE headers have been sent. OpenAI chat, Responses and Anthropic
+streams receive their own error framing. Transaction cleanup errors retain the
+primary failure instead of replacing it with a second EOF.
+
+Run `python tools/test_kv_memory_failures.py` for model-free real-process and
+HTTP/SSE regressions. It needs no GPU, account credentials or runtime service.

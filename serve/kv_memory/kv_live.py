@@ -2,12 +2,13 @@
 All model writes share one transaction; 20981 is loopback diagnostics/control.
 No prompt, response, Authorization, API key or raw tool output is logged.
 """
-import collections,contextlib,hashlib,hmac,importlib,json,os,shutil,struct,sys,threading,time,traceback,uuid
+import collections,contextlib,hashlib,hmac,importlib,json,os,queue,shutil,struct,sys,threading,time,traceback,uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from types import SimpleNamespace
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from memory_gate import MemoryGate
+from observability import snapshot, instrument_cancel, engine_class
 
 def digest(p):
  h=hashlib.sha256()
@@ -77,7 +78,7 @@ class Journal:
    with p.open('a',encoding='utf-8') as f:f.write(json.dumps(row,ensure_ascii=False)+'\n');f.flush()
    self.last.append(row)
  def exception(self,event,error,**data):
-  code=str(error).split(':',1)[0];known={'KV_CONTROL_EOF','KV_CONTROL_REJECTED','KV_CONTROL_PROTOCOL','KV_MEMBER_INTEGRITY','RESTORE_STATE_MISMATCH','PINNED_GEOMETRY_MISSING','DISK_BUDGET_EXCEEDED','MTP_ACTIVE_VALIDITY','MEMORY_UNEXPECTED_NATIVE_RESPONSE','MEMORY_PROTOCOL_REJECTED','MEMORY_PROTOCOL_DESYNC','MEMORY_CAPABILITY_MISSING'}
+  code=str(error).split(':',1)[0];known={'KV_CONTROL_EOF','KV_CONTROL_REJECTED','KV_CONTROL_PROTOCOL','KV_MEMBER_INTEGRITY','RESTORE_STATE_MISMATCH','PINNED_GEOMETRY_MISSING','DISK_BUDGET_EXCEEDED','MTP_ACTIVE_VALIDITY','MEMORY_UNEXPECTED_NATIVE_RESPONSE','MEMORY_PROTOCOL_REJECTED','MEMORY_PROTOCOL_DESYNC','MEMORY_CAPABILITY_MISSING','MEMORY_BACKEND_EOF','RESIDENT_STATE_MISMATCH','RESIDENT_BACKEND_CHANGED','KV_CONTROL_TIMEOUT'}
   self.emit(event,error_type=type(error).__name__,error_code=code if code in known else None,stack=[{'file':Path(x.filename).name,'line':x.lineno,'function':x.name} for x in traceback.extract_tb(error.__traceback__)],**data)
 
 _configured={}
@@ -86,7 +87,7 @@ def configure(cfg,server):
  if not settings.get('enabled'):return None
  root=Path(settings['root']).resolve();root.mkdir(parents=True,exist_ok=True)
  journal=Journal(root/'logs');_configured.update(root=root,journal=journal)
- Base=server.StrataEngine
+ Base=engine_class(server.StrataEngine,journal,server.FATAL_PREFIXES)
  class Engine(Base):
   def __init__(self,*args,**kw):
    # Every restart gets a UUID; PID reuse cannot overwrite earlier diagnostics.
@@ -97,8 +98,9 @@ def configure(cfg,server):
    else:kw['env']=env
    if len(args)>3:args[3]=str(run/'stderr.log')
    else:kw['log']=str(run/'stderr.log')
-   super().__init__(*args,**kw);self.silence_s=30;self.memory_run_id=ident;self.memory_trace=str(run/'trace')+'.pid'+str(self.proc.pid)
-   journal.emit('backend_ready',engine_pid=self.proc.pid,native_run=ident,engine_sha256=digest(self.exe) if hasattr(self,'exe') and Path(self.exe).is_file() else None)
+   self.memory_run_id=ident
+   super().__init__(*args,**kw);self.silence_s=30;self.memory_trace=str(run/'trace')+'.pid'+str(self.proc.pid)
+   journal.emit('backend_ready',engine_pid=self.proc.pid,native_run=ident,engine_sha256=digest(args[0]) if args and Path(args[0]).is_file() else None)
  server.StrataEngine=Engine
  return SimpleNamespace(root=root,journal=journal)
 
@@ -124,11 +126,16 @@ class Controller:
  def usage(self):return sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file())
  def qb(self,op,arg=''):
   with self.gate:
-   self.engine.proc.stdin.write(op+(' '+arg if arg else '')+'\n');self.engine.proc.stdin.flush()
+   try:self.engine.proc.stdin.write(op+(' '+arg if arg else '')+'\n');self.engine.proc.stdin.flush()
+   except (OSError,ValueError):
+    self.journal.emit('kv_control_failed',operation=op,phase='write',reason='KV_CONTROL_EOF',**snapshot(self.engine,wait=.25));raise RuntimeError('KV_CONTROL_EOF') from None
    deadline=time.monotonic()+120
    while True:
-    line=self.engine.lines.get(timeout=max(.01,deadline-time.monotonic()))
-    if line is None:raise RuntimeError('KV_CONTROL_EOF')
+    try:line=self.engine.lines.get(timeout=max(.01,deadline-time.monotonic()))
+    except queue.Empty:
+     self.journal.emit('kv_control_failed',operation=op,reason='KV_CONTROL_TIMEOUT',**snapshot(self.engine));raise RuntimeError('KV_CONTROL_TIMEOUT') from None
+    if line is None:
+     self.journal.emit('kv_control_failed',operation=op,reason='KV_CONTROL_EOF',**snapshot(self.engine,wait=.25));raise RuntimeError('KV_CONTROL_EOF')
     if line.startswith('QBRESULT '):
      r=json.loads(line[9:])
      if r.get('op')!=op or not r.get('ok') or r.get('poisoned'):raise RuntimeError('KV_CONTROL_REJECTED')
@@ -193,6 +200,9 @@ class Controller:
  def run(self,ids,thinking,tools,max_new,sampling,cancel,force=None):
   with self.gate:
    start=time.perf_counter();self.retention();rid=getattr(self.journal.local,'request_id',None) or uuid.uuid4().hex;self.journal.local.request_id=rid
+   instrument_cancel(cancel,self.journal,rid)
+   state=getattr(self.engine,'memory_lifecycle',None)
+   if state:state['request_id']=rid
    args=dict(sampling or {});matches=[i for i,x in enumerate(ids) if x==self.im_start];n=matches[-2] if len(matches)>1 else 0
    image=bool(self.image_ids.intersection(ids)) or any(x<0 for x in ids);e=self.choose(ids) if not image else None;restored=False;emitted=False;buffer=[];cache='miss';media=None;warm=False;warm_reason='not_image'
    if image:
@@ -216,6 +226,8 @@ class Controller:
    self.journal.emit('generation_start',prompt_tokens=len(ids),prompt_sha256=hashlib.sha256(struct.pack('<'+str(len(ids))+'i',*ids)).hexdigest(),max_new=max_new,thinking=bool(thinking),memory_enabled=self.enabled,image_bypass=image and not warm,has_images=image,image_count=len(media or []),resident_candidate=warm,resident_match_reason=warm_reason,resident_common_tokens=common,resident_required_prefix_tokens=len(proof['prefix_ids']) if proof else None,image_identity_sha256=hashlib.sha256(canonical(media)).hexdigest() if media else None)
    try:
     if not self.engine.alive():self.engine.restart()
+    state=getattr(self.engine,'memory_lifecycle',None)
+    if state:state['request_id']=rid
     self.qb('QBMODE','fast');self.qb('QBGEOMPREFIX','off')
     if warm:
      try:
@@ -242,9 +254,16 @@ class Controller:
     if n>0 and n<len(ids)-1:args['strata_prefix']={'tokens':n}
     # KV-restored answers are held until state/validity audit. Cold ordinary
     # requests retain streaming; a partially emitted request is never replayed.
+    heartbeat=time.monotonic()
     for item in self.original_run(ids,thinking,tools,max_new,args,cancel,force=force):
-     if restored or warm:buffer.append(item)
+     if item[0]=='ping':yield item
+     elif restored or warm:
+      buffer.append(item)
+      if time.monotonic()-heartbeat>=1:heartbeat=time.monotonic();yield ('ping',None)
      else:emitted=True;yield item
+    if cancel.is_set():
+     self.warm_images=None;self.warm_text=None
+     self.journal.emit('generation_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'),audit_skipped=True,already_emitted=emitted,**snapshot(self.engine));return
     check=self.audit()
     if image and media and not cancel.is_set() and n>0 and n<len(ids)-1 and not any(x['start']<n<x['end'] for x in media):
      status=self.qb('QBSTATUS')
@@ -268,11 +287,37 @@ class Controller:
     self.journal.emit('generation_done',cache=cache,restored=restored,image_warm_selected=warm and image,text_warm_selected=warm and not image,image_identity_verified=bool(media),total_ms=(time.perf_counter()-start)*1000,**timing)
    except BaseException as error:
     self.warm_images=None;self.warm_text=None
-    self.journal.exception('generation_failed',error,cache=cache,already_emitted=emitted);self.engine.close()
-    if (restored or warm) and not emitted and not cancel.is_set():
-     self.journal.emit('verified_restore_cold_retry');self.engine.restart();self.qb('QBNEWSEQ');args.pop('strata_prefix',None)
-     yield from self.original_run(ids,thinking,tools,max_new,args,cancel,force=force)
-    else:raise
+    self.journal.exception('generation_failed',error,cache=cache,already_emitted=emitted,cancelled=cancel.is_set(),cancel_reason=getattr(cancel,'_kv_reason',None),**snapshot(self.engine,wait=.25))
+    try:self.engine.close()
+    except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
+    # Never replay GeneratorExit, an abandoned client, or published model output.
+    # GENI embeddings are consumed/unlinked by Service._run: until their lifetime
+    # is explicitly owned by the retry, image failures fail closed to a new request.
+    retry=isinstance(error,Exception) and (restored or warm) and not emitted and not cancel.is_set() and not image
+    if retry:
+     self.journal.emit('verified_restore_cold_retry',attempt=1,original_cache=cache)
+     try:
+      self.engine.restart();self.qb('QBNEWSEQ');args.pop('strata_prefix',None);recovered=[]
+      state=getattr(self.engine,'memory_lifecycle',None)
+      if state:state['request_id']=rid
+      for item in self.original_run(ids,thinking,tools,max_new,args,cancel,force=force):
+       if item[0]=='ping':yield item
+       else:recovered.append(item)
+      if cancel.is_set():
+       self.journal.emit('cold_retry_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'));return
+      self.audit()  # A retry is not a permission to publish unchecked state.
+      last=dict(getattr(self.engine,'last',{}));timing={k:v for k,v in last.items() if isinstance(v,(int,float,str)) and k in ('reused','prompt_read','prompt_tokens','generated','prompt_ms','decode_ms','finish')}
+      self.journal.emit('cold_retry_verified',attempt=1,**timing)
+      for item in recovered:emitted=True;yield item
+      self.journal.emit('generation_done',cache='verified_cold_retry',restored=False,text_warm_selected=False,image_warm_selected=False,total_ms=(time.perf_counter()-start)*1000,**timing)
+     except BaseException as retry_error:
+      self.journal.exception('cold_retry_failed',retry_error,attempt=1,already_emitted=emitted,cancelled=cancel.is_set(),**snapshot(self.engine,wait=.25))
+      try:self.engine.close()
+      except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
+      raise
+    else:
+     self.journal.emit('cold_retry_suppressed',reason='cancelled' if cancel.is_set() else 'already_published' if emitted else 'image_embedding_lifetime' if image else 'no_reuse_or_generator_closed')
+     raise
 
 def install(svc,settings,server):
  c=Controller(svc,settings);base_make=server.make_handler
@@ -287,15 +332,44 @@ def install(svc,settings,server):
    def _json(self,code,body,*args,**kw):
     if code>=400 and isinstance(body,dict):body={**body,'kv_request_id':getattr(self,'kv_request_id',None)}
     return super()._json(code,body,*args,**kw)
+   def _watch_client(self,cancel):
+    self.kv_cancel=instrument_cancel(cancel,c.journal,self.kv_request_id)
+    return super()._watch_client(cancel)
+   def _note(self,**values):
+    if values.get('outcome')=='disconnected':
+     self.kv_outcome='cancelled'
+     if hasattr(self,'kv_cancel'):self.kv_cancel._kv_reason='client_disconnected'
+     c.journal.emit('client_disconnected',request_id=self.kv_request_id,stream_started=getattr(self,'kv_stream',False))
+    if values.get('error'):
+     self.kv_outcome='failed';c.journal.emit('sse_failed' if getattr(self,'kv_stream',False) else 'response_failed',request_id=self.kv_request_id,http_status=getattr(self,'kv_response_status',None),error_code='MODEL_OR_STREAM_ERROR')
+    parent=getattr(super(),'_note',None)
+    if parent:return parent(**values)
+   def _sse(self,*a,**kw):
+    self.kv_stream=True
+    return super()._sse(*a,**kw)
    def do_POST(self):
+    self.kv_outcome='completed';self.kv_stream=False
     self.kv_request_id=uuid.uuid4().hex;c.journal.local.request_id=self.kv_request_id;start=time.perf_counter();c.journal.emit('http_start',path=self.path.split('?')[0],content_length=self.headers.get('Content-Length'))
     try:
      with c.gate:super().do_POST()
     except BaseException as e:
-     c.journal.exception('http_failed',e)
+     self.kv_outcome='failed';c.journal.exception('http_failed',e,stream_started=self.kv_stream)
      if not getattr(self,'kv_response_started',False):self._json(503,{'error':{'type':'server_error','message':'KV request failed; report the request ID.','request_id':self.kv_request_id}})
+     elif self.kv_stream:
+      c.journal.emit('sse_failed',http_status=getattr(self,'kv_response_status',None),error_code='KV_REQUEST_FAILED')
+      error={'type':'server_error','code':'KV_REQUEST_FAILED','message':'Request failed safely; retry with the complete history.','request_id':self.kv_request_id}
+      if self.path.split('?')[0].endswith('/responses'):
+       frame='event: response.failed\ndata: '+json.dumps({'type':'response.failed','response':{'status':'failed','error':error}})+'\n\n'
+      elif self.path.split('?')[0].endswith('/messages'):
+       frame='event: error\ndata: '+json.dumps({'type':'error','error':error})+'\n\n'
+      else:frame='data: '+json.dumps({'error':error})+'\n\ndata: [DONE]\n\n'
+      try:self.wfile.write(frame.encode());self.wfile.flush();self.close_connection=True
+      except OSError as write_error:c.journal.emit('sse_write_failed',error_type=type(write_error).__name__)
      else:raise
-    finally:c.journal.emit('http_end',status=getattr(self,'kv_response_status',None),wall_ms=(time.perf_counter()-start)*1000)
+    finally:
+     cancel=getattr(self,'kv_cancel',None)
+     if cancel is not None and cancel.is_set() and self.kv_outcome=='completed':self.kv_outcome='cancelled'
+     c.journal.emit('http_end',status=getattr(self,'kv_response_status',None),outcome=self.kv_outcome,stream=self.kv_stream,wall_ms=(time.perf_counter()-start)*1000)
   return Handler
  server.make_handler=make
  class Control(BaseHTTPRequestHandler):

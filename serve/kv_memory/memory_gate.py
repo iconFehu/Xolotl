@@ -4,6 +4,7 @@ Lock order: MemoryGate -> Service FIFO -> native stream. A transaction cannot be
 held across unrelated HTTP requests. Restore/generate/save run in one scope.
 """
 import contextlib,json,threading,time,uuid
+from observability import snapshot
 
 class FencedInput:
  def __init__(self,gate,raw):self.gate=gate;self.raw=raw
@@ -29,12 +30,16 @@ class MemoryGate:
  def __init__(self,owner):
   self.owner=owner;self.lock=threading.RLock();self.local=threading.local();self.proc=None;self.raw=None;self.ident=None;self.events=[];self.sequence=0
  def exchange(self,line):
-  self.raw.write(line+'\n');self.raw.flush();deadline=time.monotonic()+120
+  try:self.raw.write(line+'\n');self.raw.flush()
+  except (OSError,ValueError):
+   self.owner.journal.emit('memory_control_failed',operation=line.split(' ',1)[0],phase='write',reason='MEMORY_BACKEND_EOF',**snapshot(self.owner.engine,wait=.25));raise RuntimeError('MEMORY_BACKEND_EOF') from None
+  deadline=time.monotonic()+120
   while True:
    self.local.reading_control=True
    try:item=self.owner.engine.lines.get(timeout=max(.01,deadline-time.monotonic()))
    finally:self.local.reading_control=False
-   if item is None:raise RuntimeError('MEMORY_BACKEND_EOF')
+   if item is None:
+    self.owner.journal.emit('memory_control_failed',operation=line.split(' ',1)[0],phase='read',reason='MEMORY_BACKEND_EOF',**snapshot(self.owner.engine,wait=.25));raise RuntimeError('MEMORY_BACKEND_EOF')
    if not item.startswith('MEMRESULT '):raise RuntimeError('MEMORY_PROTOCOL_DESYNC')
    answer=json.loads(item[10:])
    if answer.get('version')!=1 or not answer.get('ok'):raise RuntimeError('MEMORY_PROTOCOL_REJECTED:'+str(answer.get('error')))
@@ -70,8 +75,12 @@ class MemoryGate:
      reply=self.exchange('MEM_END '+self.ident);self.events.append({'event':'end','sequence':self.sequence,'pid':self.proc.pid,'native_epoch':reply['epoch'],'thread':threading.get_ident()})
     else:self.events.append({'event':'backend_discarded','sequence':self.sequence})
     self.ident=None
-  except BaseException:
-   self.ident=None;self.owner.engine.close();raise
+  except BaseException as cleanup:
+   self.ident=None
+   self.owner.journal.exception('transaction_cleanup_failed',cleanup,primary_error_type=type(error[1]).__name__ if error[1] else None)
+   try:self.owner.engine.close()
+   except Exception as close_error:self.owner.journal.exception('backend_cleanup_failed',close_error)
+   if error[0] is None:raise
   finally:self.local.depth-=1;self.lock.release()
  def install_service(self,service):
   # Wrap BEFORE Service acquires its own FIFO, avoiding FIFO->gate inversion.
