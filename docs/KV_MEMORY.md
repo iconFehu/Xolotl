@@ -192,3 +192,35 @@ primary failure instead of replacing it with a second EOF.
 
 Run `python tools/test_kv_memory_failures.py` for model-free real-process and
 HTTP/SSE regressions. It needs no GPU, account credentials or runtime service.
+
+## Redacted runtime ERR records
+
+After READY, the adapter classifies native `ERR` frames before forwarding them
+to the server. Only fixed templates and bounded numeric fields are retained.
+For example, `GEOMETRY_LINEAGE_MISS resume=221082 identity` becomes code
+`GEOMETRY_LINEAGE_IDENTITY` with `parameters.resume=221082`. This means a saved
+geometry tape was found at that position but its token/image identity did not
+match the requested prefix. It is a refusal to reuse, not proof of a crash or
+permission to bypass geometry/MTP validation.
+
+`native_error` includes a unique `error_id`, request ID, native run UUID/PID,
+operation, family, code and safe summary. Its frame is sanitized before ordinary
+`ValueError` handling, so that handler's stdout/API error message cannot re-emit
+arbitrary native text. `generation_failed.native_error` and
+`cold_retry_failed.native_error` only link to a matching error from the same
+request; a stale native error is not attached to an unrelated exception.
+
+Unknown messages are replaced with `NATIVE_ERR_UNCLASSIFIED [native message
+omitted]`. There is no raw-message or partially scrubbed fallback field. Paths,
+URLs, credentials, prompt fragments, extra suffixes and multiline payloads do not
+pass the template allowlist. A private 32-byte `native-log-key.bin` in the data
+directory produces a keyed fingerprint for repeated-message correlation; never
+publish or include this key in a diagnostic export. It is separate from API keys
+and checkpoint authentication. Fingerprints differ across independent data roots.
+
+This scope covers runtime ERR frames and their downstream error handling. It
+does not claim that startup logs, previously written logs, raw native stderr or
+KV/state traces have been scrubbed; keep those private. Existing one-shot,
+audited full-text fallback, cancellation and image lifetime restrictions remain.
+Run `python tools/test_kv_memory_native_errors.py` for classifier/privacy and
+real-child-pipe regression tests.

@@ -3,7 +3,8 @@
 Only classifiers/hashes enter the journal. Native stdout can contain tokens:
 never copy arbitrary stdout, exception strings, argv or request bodies here.
 """
-import hashlib, threading, time
+import hashlib, threading, time, uuid
+from native_errors import classify_native_error
 
 def snapshot(engine, wait=0):
     state = getattr(engine, 'memory_lifecycle', None)
@@ -48,6 +49,13 @@ def engine_class(Base, journal, fatal_prefixes):
             line = None
             try:
                 for line in proc.stdout:
+                    safe_error = None
+                    if line.startswith(('ERR', 'FATAL ')):
+                        safe_error = classify_native_error(line,journal.native_error_key)
+                        safe_error.update(error_id=uuid.uuid4().hex,request_id=state.get('request_id'),
+                                          operation=state.get('operation','unknown'),native_run=state['run'],engine_pid=proc.pid)
+                        state['native_error'] = safe_error
+                        journal.emit('native_error',**safe_error)
                     if line.startswith(fatal_prefixes):
                         state.update(cause='native_verifier_fatal', fatal='VERIFY_TIMEOUT' if 'timed out' in line else 'VERIFY_PREVIOUS_WINDOW_UNFINISHED',
                                      fatal_sha256=hashlib.sha256(line.encode()).hexdigest())
@@ -56,10 +64,14 @@ def engine_class(Base, journal, fatal_prefixes):
                             self.silent_note = 'KV_NATIVE_VERIFIER_FATAL'; self.ended = True
                         try: proc.terminate()
                         except OSError: pass
+                        line='ERR '+safe_error['summary']+'\n'
                         break
                     if line.startswith(('BT ', 'BDONE ')) and slot_q:
                         try: slot_q[int(line.split()[1])].put(line); continue
                         except (IndexError, ValueError): pass
+                    # Downstream ValueError/public SSE/server stdout must never
+                    # re-emit an arbitrary native payload. Preserve ERR framing.
+                    if safe_error:line=('FATAL ' if line.startswith('FATAL ') else 'ERR ')+safe_error['summary']+'\n'
                     lines.put(line)
             except (OSError, ValueError) as error:
                 journal.emit('native_stdout_failed', request_id=state.get('request_id'), error_type=type(error).__name__,

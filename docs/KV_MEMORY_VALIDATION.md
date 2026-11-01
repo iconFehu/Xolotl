@@ -88,3 +88,38 @@ models, text/image generation, resident text/image SSE reuse and Summary Off
 probes passed, with native state/MTP audits and protected-file hashes checked.
 No fault-injection module or test-only control endpoint is installed in the
 live adapter. These checks do not replace long-duration stability testing.
+
+## Runtime ERR classification follow-up (2026-11-01)
+
+The deployed native executable and server hook were unchanged. Five feature
+scripts passed: the existing default-off, image, ordinary adapter and EOF/SSE
+failure suites, plus `tools/test_kv_memory_native_errors.py`. The new script
+checks ten recognized message forms, bounded numeric parameters, omitted unknown
+credentials/paths/URLs/prompt fragments, suffix/multiline/oversize inputs, keyed
+fingerprints, real-child pipe sanitization and same-request exception association.
+
+An isolated instance of the deployed GPU candidate handled five fixture queries:
+prime, an actual native ERR followed by verified cold retry, re-prime, two ERRs
+ending in explicit SSE failure without model output, and next-request recovery.
+The fixture deliberately sent `GEN max_new=0` for selected native calls; ordinary
+API requests still used an 8192 output limit. All three native errors were
+classified as `INVALID_MAX_NEW`, assigned different error IDs and linked to their
+generation/retry failures. The server's stdout received the sanitized summary.
+The test-only adapter is not installed in the live runtime. It validates error
+handling, **not** bitwise replay of a missing historical 221K-token request.
+
+The historical ValueError was independently located in retained frontend stdout:
+`GEOMETRY_LINEAGE_MISS resume=221082 identity`. Source inspection shows an
+identity rejection after a length-indexed geometry entry was found, before new
+prefill. The preceding prompt geometry covered 219278 tokens while the main
+state reached 221082. Without the old geometry-map snapshot and complete failed
+history, the exact writer/origin of the mismatched entry is not established.
+The historical guard correctly refused it; a verified complete-text retry
+recomputed 221370 tokens and completed in 157.862 seconds. Neither the guard nor
+the 32K+ geometry replay constraint was relaxed by this logging change.
+
+Local and public models, normal text/image generation, resident text/image SSE
+reuse and Summary Off probes passed after activation. Protected-file and native
+state/MTP audits passed. Startup/old/raw stderr/state logs remain private and are
+outside the runtime ERR sanitization guarantee. The prior cancellation/engine
+survival limitation and other platform/long-duration limitations still apply.

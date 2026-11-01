@@ -9,6 +9,7 @@ from types import SimpleNamespace
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from memory_gate import MemoryGate
 from observability import snapshot, instrument_cancel, engine_class
+from native_errors import error_reference
 
 def digest(p):
  h=hashlib.sha256()
@@ -65,7 +66,13 @@ def warm_text_match(warm,proc,ids):
  return True,'exact_text_history_and_backend'
 
 class Journal:
- def __init__(self,root):self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True);self.lock=threading.RLock();self.local=threading.local();self.last=collections.deque(maxlen=100)
+ def __init__(self,root):
+  self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True);self.lock=threading.RLock();self.local=threading.local();self.last=collections.deque(maxlen=100)
+  keyfile=self.root.parent/'native-log-key.bin'
+  if keyfile.is_symlink():raise RuntimeError('NATIVE_LOG_KEY_INVALID')
+  if not keyfile.exists():atomic(keyfile,os.urandom(32))
+  self.native_error_key=keyfile.read_bytes()
+  if len(self.native_error_key)!=32:raise RuntimeError('NATIVE_LOG_KEY_INVALID')
  def emit(self,event,**data):
   row={'utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'event':event,'request_id':getattr(self.local,'request_id',None),'pid':os.getpid(),**data}
   with self.lock:
@@ -79,7 +86,8 @@ class Journal:
    self.last.append(row)
  def exception(self,event,error,**data):
   code=str(error).split(':',1)[0];known={'KV_CONTROL_EOF','KV_CONTROL_REJECTED','KV_CONTROL_PROTOCOL','KV_MEMBER_INTEGRITY','RESTORE_STATE_MISMATCH','PINNED_GEOMETRY_MISSING','DISK_BUDGET_EXCEEDED','MTP_ACTIVE_VALIDITY','MEMORY_UNEXPECTED_NATIVE_RESPONSE','MEMORY_PROTOCOL_REJECTED','MEMORY_PROTOCOL_DESYNC','MEMORY_CAPABILITY_MISSING','MEMORY_BACKEND_EOF','RESIDENT_STATE_MISMATCH','RESIDENT_BACKEND_CHANGED','KV_CONTROL_TIMEOUT'}
-  self.emit(event,error_type=type(error).__name__,error_code=code if code in known else None,stack=[{'file':Path(x.filename).name,'line':x.lineno,'function':x.name} for x in traceback.extract_tb(error.__traceback__)],**data)
+  native=data.get('native_error');safe_code=native.get('code') if isinstance(native,dict) else None
+  self.emit(event,error_type=type(error).__name__,error_code=code if code in known else safe_code,stack=[{'file':Path(x.filename).name,'line':x.lineno,'function':x.name} for x in traceback.extract_tb(error.__traceback__)],**data)
 
 _configured={}
 def configure(cfg,server):
@@ -287,7 +295,7 @@ class Controller:
     self.journal.emit('generation_done',cache=cache,restored=restored,image_warm_selected=warm and image,text_warm_selected=warm and not image,image_identity_verified=bool(media),total_ms=(time.perf_counter()-start)*1000,**timing)
    except BaseException as error:
     self.warm_images=None;self.warm_text=None
-    self.journal.exception('generation_failed',error,cache=cache,already_emitted=emitted,cancelled=cancel.is_set(),cancel_reason=getattr(cancel,'_kv_reason',None),**snapshot(self.engine,wait=.25))
+    self.journal.exception('generation_failed',error,cache=cache,already_emitted=emitted,cancelled=cancel.is_set(),cancel_reason=getattr(cancel,'_kv_reason',None),native_error=error_reference(self.engine,error,rid),**snapshot(self.engine,wait=.25))
     try:self.engine.close()
     except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
     # Never replay GeneratorExit, an abandoned client, or published model output.
@@ -311,7 +319,7 @@ class Controller:
       for item in recovered:emitted=True;yield item
       self.journal.emit('generation_done',cache='verified_cold_retry',restored=False,text_warm_selected=False,image_warm_selected=False,total_ms=(time.perf_counter()-start)*1000,**timing)
      except BaseException as retry_error:
-      self.journal.exception('cold_retry_failed',retry_error,attempt=1,already_emitted=emitted,cancelled=cancel.is_set(),**snapshot(self.engine,wait=.25))
+      self.journal.exception('cold_retry_failed',retry_error,attempt=1,already_emitted=emitted,cancelled=cancel.is_set(),native_error=error_reference(self.engine,retry_error,rid),**snapshot(self.engine,wait=.25))
       try:self.engine.close()
       except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
       raise
@@ -350,6 +358,8 @@ def install(svc,settings,server):
    def do_POST(self):
     self.kv_outcome='completed';self.kv_stream=False
     self.kv_request_id=uuid.uuid4().hex;c.journal.local.request_id=self.kv_request_id;start=time.perf_counter();c.journal.emit('http_start',path=self.path.split('?')[0],content_length=self.headers.get('Content-Length'))
+    state=getattr(c.engine,'memory_lifecycle',None)
+    if state:state['request_id']=self.kv_request_id
     try:
      with c.gate:super().do_POST()
     except BaseException as e:

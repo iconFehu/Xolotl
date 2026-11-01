@@ -11,7 +11,12 @@ class FencedInput:
  def write(self,data):
   kind=data.split(' ',1)[0].split('\n',1)[0]
   if kind in {'GEN','GENI','SAVE','RESTORE'} or kind.startswith('QB'):
-   self.gate.require_owner();data='MEM_CALL '+self.gate.ident+' '+data
+   self.gate.require_owner()
+   state=getattr(self.gate.owner.engine,'memory_lifecycle',None)
+   if state:
+    state['operation']=kind
+    if kind in {'GEN','GENI'}:state.pop('native_error',None)
+   data='MEM_CALL '+self.gate.ident+' '+data
   return self.raw.write(data)
  def __getattr__(self,name):return getattr(self.raw,name)
 
@@ -30,6 +35,8 @@ class MemoryGate:
  def __init__(self,owner):
   self.owner=owner;self.lock=threading.RLock();self.local=threading.local();self.proc=None;self.raw=None;self.ident=None;self.events=[];self.sequence=0
  def exchange(self,line):
+  state=getattr(self.owner.engine,'memory_lifecycle',None)
+  if state:state['operation']=line.split(' ',1)[0]
   try:self.raw.write(line+'\n');self.raw.flush()
   except (OSError,ValueError):
    self.owner.journal.emit('memory_control_failed',operation=line.split(' ',1)[0],phase='write',reason='MEMORY_BACKEND_EOF',**snapshot(self.owner.engine,wait=.25));raise RuntimeError('MEMORY_BACKEND_EOF') from None
