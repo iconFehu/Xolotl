@@ -14,7 +14,7 @@ class FencedInput:
    self.gate.require_owner()
    state=getattr(self.gate.owner.engine,'memory_lifecycle',None)
    if state:
-    state['operation']=kind
+    state['operation']=kind;state['request_id']=getattr(self.gate.local,'request_id',None)
     if kind in {'GEN','GENI'}:state.pop('native_error',None)
    data='MEM_CALL '+self.gate.ident+' '+data
   return self.raw.write(data)
@@ -36,7 +36,7 @@ class MemoryGate:
   self.owner=owner;self.lock=threading.RLock();self.local=threading.local();self.proc=None;self.raw=None;self.ident=None;self.events=[];self.sequence=0
  def exchange(self,line):
   state=getattr(self.owner.engine,'memory_lifecycle',None)
-  if state:state['operation']=line.split(' ',1)[0]
+  if state:state['operation']=line.split(' ',1)[0];state['request_id']=getattr(self.local,'request_id',None)
   try:self.raw.write(line+'\n');self.raw.flush()
   except (OSError,ValueError):
    self.owner.journal.emit('memory_control_failed',operation=line.split(' ',1)[0],phase='write',reason='MEMORY_BACKEND_EOF',**snapshot(self.owner.engine,wait=.25));raise RuntimeError('MEMORY_BACKEND_EOF') from None
@@ -64,11 +64,18 @@ class MemoryGate:
   if not all(caps.get(k) is True for k in ('geometry_replay','mtp_active_audit','transaction_fence')):raise RuntimeError('MEMORY_CAPABILITY_MISSING')
   ident=uuid.uuid4().hex;reply=self.exchange('MEM_BEGIN '+ident);self.ident=ident;self.sequence+=1
   self.events.append({'event':'begin','sequence':self.sequence,'pid':p.pid,'native_epoch':reply['epoch'],'thread':threading.get_ident()})
+ def claim_request(self,rid):
+  if not getattr(self.local,'depth',0):raise RuntimeError('MEMORY_TRANSACTION_REQUIRED')
+  previous=getattr(self.local,'request_id',None)
+  if previous is not None and previous!=rid:raise RuntimeError('MEMORY_REQUEST_OWNER_CHANGED')
+  self.local.request_id=rid
  def __enter__(self):
-  self.lock.acquire();self.local.depth=getattr(self.local,'depth',0)+1
+  self.lock.acquire()
+  if not getattr(self.local,'depth',0):self.local.request_id=getattr(self.owner.journal.local,'request_id',None)
+  self.local.depth=getattr(self.local,'depth',0)+1
   try:
    p=self.owner.engine.proc
-   if p is not None and p.poll() is None:self.bind()
+   if p is not None and p.poll() is None and not getattr(self.owner.engine,'ended',False):self.bind()
    return self
   except BaseException:
    self.ident=None

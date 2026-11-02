@@ -123,3 +123,43 @@ reuse and Summary Off probes passed after activation. Protected-file and native
 state/MTP audits passed. Startup/old/raw stderr/state logs remain private and are
 outside the runtime ERR sanitization guarantee. The prior cancellation/engine
 survival limitation and other platform/long-duration limitations still apply.
+
+## Cancelled prefill / queued ownership follow-up (2026-11-02)
+
+The old deployed candidate was reproduced independently: a 264063-token prompt
+was disconnected after progress reached 8192 tokens. Its nominal final-window
+MTP check reported missing cells, followed by `MEM_END` EOF and process exit.
+The old adapter's actual two-request HTTP test also reproduced queued B replacing
+active A's native request ID. The repaired adapter passes the same ownership test.
+
+The revised candidate passed 16 isolated GPU/API cases covering ordinary answers,
+cold-prefill cancellation/retry, a persistent checkpoint followed by restored
+prefill cancellation/retry, decode cancellation/retry, queued/disconnected B while
+A owns the native lease, controlled reset failure/discard/recovery, reasoning
+budget continuation, forced tool choice, explicit re-priming and one bounded
+audited retry after a real injected native ERR. In normal cancellation cases the
+original native PID was retained; no candidate MTP miss or control EOF occurred.
+State/GDN/PLE/index/MTP audits and expected synthetic record values passed.
+
+The native reset-required boundary is limited to cancelled **prefill**. Ordinary
+decoder STOP also serves reasoning-budget/tool continuations and must remain
+usable. The first candidate's broader decoder-STOP boundary was identified during
+coverage review; an activation hold arrived after CAS, so that candidate was
+briefly enabled and then restored to the previous version. That interval's logs
+contain only six fixed acceptance probes and no recorded failures. It is not
+counted as final acceptance. A later isolated acceptance failed because the ERR
+fixture lost its warm-history precondition after tool testing; cold ERR was
+correctly not replayed. That failed round is retained, not counted as a pass.
+Final acceptance explicitly re-primes before testing the existing reuse retry.
+
+Both the pinned candidate and fork CUDA builds passed. The deployed executable
+uses the same eleven frozen compute libraries as the previous deployment; its
+native host/control source changed. The newly compiled fork executable itself was
+not installed. Six model-free CTest contracts (including cancel policy) and the
+Python default, image, adapter, ERR, EOF/SSE and cancellation/ownership suites
+passed. Local/public text, vision, resident SSE reuse and Summary Off probes
+passed after activation, with configuration/key/protected-file checks and
+rollback evidence retained. No HIP/SYCL, long-duration soak, full-window accuracy
+or Desktop AgentLoop certification is implied. Genuine non-cancelled validity
+failures still fail closed; only unconsumable cancelled prefill avoids the false
+full-prompt completion check.

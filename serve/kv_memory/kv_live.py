@@ -106,7 +106,7 @@ def configure(cfg,server):
    else:kw['env']=env
    if len(args)>3:args[3]=str(run/'stderr.log')
    else:kw['log']=str(run/'stderr.log')
-   self.memory_run_id=ident
+   self.memory_run_id=ident;self.memory_start_request_id=getattr(journal.local,'request_id',None)
    super().__init__(*args,**kw);self.silence_s=30;self.memory_trace=str(run/'trace')+'.pid'+str(self.proc.pid)
    journal.emit('backend_ready',engine_pid=self.proc.pid,native_run=ident,engine_sha256=digest(args[0]) if args and Path(args[0]).is_file() else None)
  server.StrataEngine=Engine
@@ -205,9 +205,27 @@ class Controller:
    files=sorted([p for p in run.iterdir() if p.is_file() and (p.name.endswith('.cells.u64') or '.geometry.r' in p.name)],key=lambda p:p.stat().st_mtime,reverse=True)
    for p in files[30:]:
     if p.resolve().parent==run.resolve():p.unlink()
+ def reset_cancelled(self,reason):
+  self.warm_images=None;self.warm_text=None
+  try:
+   if not self.engine.alive():raise RuntimeError('CANCEL_BACKEND_NOT_ALIVE')
+   reply=self.qb('QBHOTRESET')
+   if not reply.get('weights_retained') or reply.get('live_count')!=0 or not reply.get('guard',{}).get('ok'):raise RuntimeError('CANCEL_RESET_UNVERIFIED')
+   status=self.qb('QBSTATUS')
+   if status.get('live_count')!=0 or status.get('live_ok'):raise RuntimeError('CANCEL_RESET_UNVERIFIED')
+   if getattr(self.engine,'memory_lifecycle',{}).get('cancel_reset_required') is True:raise RuntimeError('CANCEL_RESET_UNVERIFIED')
+   self.journal.emit('cancel_reset_verified',reason=reason,weights_retained=True,live_count=0,**snapshot(self.engine))
+   return True
+  except Exception as error:
+   self.journal.exception('cancel_reset_failed',error,reason=reason,**snapshot(self.engine))
+   try:self.engine.close()
+   except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
+   self.journal.emit('cancel_backend_discarded',cold_next_request=True)
+   return False
  def run(self,ids,thinking,tools,max_new,sampling,cancel,force=None):
   with self.gate:
    start=time.perf_counter();self.retention();rid=getattr(self.journal.local,'request_id',None) or uuid.uuid4().hex;self.journal.local.request_id=rid
+   if hasattr(self.gate,'claim_request'):self.gate.claim_request(rid)
    instrument_cancel(cancel,self.journal,rid)
    state=getattr(self.engine,'memory_lifecycle',None)
    if state:state['request_id']=rid
@@ -263,15 +281,16 @@ class Controller:
     # KV-restored answers are held until state/validity audit. Cold ordinary
     # requests retain streaming; a partially emitted request is never replayed.
     heartbeat=time.monotonic()
-    for item in self.original_run(ids,thinking,tools,max_new,args,cancel,force=force):
-     if item[0]=='ping':yield item
-     elif restored or warm:
-      buffer.append(item)
-      if time.monotonic()-heartbeat>=1:heartbeat=time.monotonic();yield ('ping',None)
-     else:emitted=True;yield item
+    with contextlib.closing(self.original_run(ids,thinking,tools,max_new,args,cancel,force=force)) as source:
+     for item in source:
+      if item[0]=='ping':yield item
+      elif restored or warm:
+       buffer.append(item)
+       if time.monotonic()-heartbeat>=1:heartbeat=time.monotonic();yield ('ping',None)
+      else:emitted=True;yield item
     if cancel.is_set():
      self.warm_images=None;self.warm_text=None
-     self.journal.emit('generation_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'),audit_skipped=True,already_emitted=emitted,**snapshot(self.engine));return
+     self.journal.emit('generation_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'),audit_skipped=True,already_emitted=emitted,**snapshot(self.engine));self.reset_cancelled(getattr(cancel,'_kv_reason','caller_cancelled'));return
     check=self.audit()
     if image and media and not cancel.is_set() and n>0 and n<len(ids)-1 and not any(x['start']<n<x['end'] for x in media):
      status=self.qb('QBSTATUS')
@@ -295,6 +314,10 @@ class Controller:
     self.journal.emit('generation_done',cache=cache,restored=restored,image_warm_selected=warm and image,text_warm_selected=warm and not image,image_identity_verified=bool(media),total_ms=(time.perf_counter()-start)*1000,**timing)
    except BaseException as error:
     self.warm_images=None;self.warm_text=None
+    if isinstance(error,GeneratorExit) or cancel.is_set():
+     if not cancel.is_set():cancel._kv_reason='consumer_closed';cancel.set()
+     self.journal.emit('generation_cancelled',reason=getattr(cancel,'_kv_reason','consumer_closed'),audit_skipped=True,consumer_closed=isinstance(error,GeneratorExit),already_emitted=emitted)
+     self.reset_cancelled(getattr(cancel,'_kv_reason','consumer_closed'));return
     self.journal.exception('generation_failed',error,cache=cache,already_emitted=emitted,cancelled=cancel.is_set(),cancel_reason=getattr(cancel,'_kv_reason',None),native_error=error_reference(self.engine,error,rid),**snapshot(self.engine,wait=.25))
     try:self.engine.close()
     except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
@@ -308,17 +331,21 @@ class Controller:
       self.engine.restart();self.qb('QBNEWSEQ');args.pop('strata_prefix',None);recovered=[]
       state=getattr(self.engine,'memory_lifecycle',None)
       if state:state['request_id']=rid
-      for item in self.original_run(ids,thinking,tools,max_new,args,cancel,force=force):
-       if item[0]=='ping':yield item
-       else:recovered.append(item)
+      with contextlib.closing(self.original_run(ids,thinking,tools,max_new,args,cancel,force=force)) as retry_source:
+       for item in retry_source:
+        if item[0]=='ping':yield item
+        else:recovered.append(item)
       if cancel.is_set():
-       self.journal.emit('cold_retry_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'));return
+       self.journal.emit('cold_retry_cancelled',reason=getattr(cancel,'_kv_reason','caller_cancelled'));self.reset_cancelled(getattr(cancel,'_kv_reason','caller_cancelled'));return
       self.audit()  # A retry is not a permission to publish unchecked state.
       last=dict(getattr(self.engine,'last',{}));timing={k:v for k,v in last.items() if isinstance(v,(int,float,str)) and k in ('reused','prompt_read','prompt_tokens','generated','prompt_ms','decode_ms','finish')}
       self.journal.emit('cold_retry_verified',attempt=1,**timing)
       for item in recovered:emitted=True;yield item
       self.journal.emit('generation_done',cache='verified_cold_retry',restored=False,text_warm_selected=False,image_warm_selected=False,total_ms=(time.perf_counter()-start)*1000,**timing)
      except BaseException as retry_error:
+      if isinstance(retry_error,GeneratorExit) or cancel.is_set():
+       if not cancel.is_set():cancel._kv_reason='consumer_closed';cancel.set()
+       self.journal.emit('cold_retry_cancelled',reason=getattr(cancel,'_kv_reason','consumer_closed'));self.reset_cancelled(getattr(cancel,'_kv_reason','consumer_closed'));return
       self.journal.exception('cold_retry_failed',retry_error,attempt=1,already_emitted=emitted,cancelled=cancel.is_set(),native_error=error_reference(self.engine,retry_error,rid),**snapshot(self.engine,wait=.25))
       try:self.engine.close()
       except Exception as cleanup:self.journal.exception('backend_cleanup_failed',cleanup)
@@ -358,11 +385,14 @@ def install(svc,settings,server):
    def do_POST(self):
     self.kv_outcome='completed';self.kv_stream=False
     self.kv_request_id=uuid.uuid4().hex;c.journal.local.request_id=self.kv_request_id;start=time.perf_counter();c.journal.emit('http_start',path=self.path.split('?')[0],content_length=self.headers.get('Content-Length'))
-    state=getattr(c.engine,'memory_lifecycle',None)
-    if state:state['request_id']=self.kv_request_id
     try:
      with c.gate:super().do_POST()
     except BaseException as e:
+     if isinstance(e,ConnectionError):
+      self.kv_outcome='cancelled'
+      cancel=getattr(self,'kv_cancel',None)
+      if cancel is not None:cancel._kv_reason='client_disconnected';cancel.set()
+      c.journal.emit('http_cancelled',reason='client_disconnected',error_type=type(e).__name__);return
      self.kv_outcome='failed';c.journal.exception('http_failed',e,stream_started=self.kv_stream)
      if not getattr(self,'kv_response_started',False):self._json(503,{'error':{'type':'server_error','message':'KV request failed; report the request ID.','request_id':self.kv_request_id}})
      elif self.kv_stream:

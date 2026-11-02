@@ -7,6 +7,7 @@ publishing a dictionary-testable hash of potentially sensitive error text.
 import hashlib, hmac, re
 
 _FIXED = {
+ 'CANCEL_RESET_REQUIRED': ('CANCEL_RESET_REQUIRED','cancellation'),
  'QSA prototype session is not healthy': ('QSA_SESSION_UNHEALTHY','state'),
  'isolated resume requires empty released archive bank, checkpoints and real MTP ring': ('QSA_RESUME_PRECONDITION','state'),
  'selective base requires exact live-prefix extension': ('QSA_SELECTIVE_PREFIX','identity'),

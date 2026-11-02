@@ -3,7 +3,7 @@
 Only classifiers/hashes enter the journal. Native stdout can contain tokens:
 never copy arbitrary stdout, exception strings, argv or request bodies here.
 """
-import hashlib, threading, time, uuid
+import hashlib, threading, time, uuid, re
 from native_errors import classify_native_error
 
 def snapshot(engine, wait=0):
@@ -38,10 +38,10 @@ def engine_class(Base, journal, fatal_prefixes):
         def _pump(self):
             proc, lines, slot_q = self.proc, self.lines, self.slot_q
             state = self.memory_lifecycle = {'proc': proc, 'run': self.memory_run_id,
-                                            'cause': 'native_exit_or_external_termination', 'eof': False}
+                                            'cause': 'native_exit_or_external_termination', 'eof': False, 'request_id':getattr(self,'memory_start_request_id',None)}
             def reap():
                 rc = proc.wait()
-                journal.emit('native_exit', request_id=state.get('request_id'), engine_pid=proc.pid,
+                journal.emit('native_exit', request_id=state.get('exit_request_id',state.get('terminal_request_id',state.get('request_id'))), engine_pid=proc.pid,
                              native_run=state['run'], exit_code=rc, exit_code_hex=f'0x{rc & 0xffffffff:08X}',
                              termination_cause=state['cause'], stdout_eof=state['eof'],
                              fatal_code=state.get('fatal'), fatal_sha256=state.get('fatal_sha256'))
@@ -49,6 +49,16 @@ def engine_class(Base, journal, fatal_prefixes):
             line = None
             try:
                 for line in proc.stdout:
+                    decode=re.fullmatch(r'REUSED ([0-9]+)\s*',line)
+                    if decode:
+                        state['decode_ready']=True
+                        journal.emit('native_decode_ready',request_id=state.get('request_id'),native_run=state['run'],engine_pid=proc.pid,reused=int(decode[1]))
+                    reset_state=re.fullmatch(r'CANCEL_STATE reset_required=([01])\s*',line)
+                    if reset_state:
+                        state['cancel_reset_required']=bool(int(reset_state[1]))
+                        journal.emit('native_cancel_state',request_id=state.get('request_id'),native_run=state['run'],engine_pid=proc.pid,reset_required=state['cancel_reset_required'])
+                    progress=re.fullmatch(r'CANCELLED_PREFILL reached=([0-9]+) requested=([0-9]+) exact=([01]) reset_required=1\s*',line)
+                    if progress:journal.emit('native_cancel_progress',request_id=state.get('request_id'),native_run=state['run'],engine_pid=proc.pid,reached=int(progress[1]),requested=int(progress[2]),exact=bool(int(progress[3])),reset_required=True)
                     safe_error = None
                     if line.startswith(('ERR', 'FATAL ')):
                         safe_error = classify_native_error(line,journal.native_error_key)
@@ -77,7 +87,7 @@ def engine_class(Base, journal, fatal_prefixes):
                 journal.emit('native_stdout_failed', request_id=state.get('request_id'), error_type=type(error).__name__,
                              engine_pid=proc.pid, native_run=state['run'])
             finally:
-                state['eof'] = True
+                state['eof'] = True;state.setdefault('terminal_request_id',state.get('request_id'))
                 if self.proc is proc:
                     self.ended = True
                     if line and line.startswith('ERR'): self.last_err = line[4:].strip()
@@ -92,6 +102,7 @@ def engine_class(Base, journal, fatal_prefixes):
         def close(self):
             state = getattr(self, 'memory_lifecycle', None)
             if state and self.proc is state['proc'] and self.proc.poll() is None:
+                state.setdefault('exit_request_id',state.get('terminal_request_id',state.get('request_id')))
                 # An earlier EOF/fatal remains the primary cause, never relabel it as a normal close.
                 if not state['eof'] and state['cause'] == 'native_exit_or_external_termination':
                     state['cause'] = 'server_close_requested'

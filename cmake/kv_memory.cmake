@@ -47,7 +47,7 @@ target_sources(strata_kernels PRIVATE "${_kv_native}/qsa_block_mask.cu" "${_kv_n
 option(STRATA_BUILD_KV_MEMORY_TESTS "Build model-free KV contract tests and a CUDA parity executable" ON)
 if(STRATA_BUILD_KV_MEMORY_TESTS)
   enable_testing()
-  foreach(_case memory_fence geometry mtp_validity compact_layout hot_reset_contract)
+  foreach(_case memory_fence geometry mtp_validity compact_layout hot_reset_contract cancel_policy)
     add_executable(kv_${_case}_test "${_kv_native}/${_case}_test.cpp")
     target_include_directories(kv_${_case}_test PRIVATE "${_kv_native}" "${CMAKE_SOURCE_DIR}/include")
     target_link_libraries(kv_${_case}_test PRIVATE CUDA::cudart)

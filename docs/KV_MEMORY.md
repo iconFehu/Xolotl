@@ -224,3 +224,42 @@ KV/state traces have been scrubbed; keep those private. Existing one-shot,
 audited full-text fallback, cancellation and image lifetime restrictions remain.
 Run `python tools/test_kv_memory_native_errors.py` for classifier/privacy and
 real-child-pipe regression tests.
+
+## Cancelled prefill and request ownership
+
+MTP prefill may intentionally populate only the final draft window of the
+requested prompt. A prompt stopped at an earlier chunk has not populated that
+nominal window. Checking it as though the full prompt completed produces a
+misleading `MTP_VALIDITY_MISS` and ends the process before `MEM_END`.
+
+The native overlay now distinguishes cancelled prefill from normal completion.
+A cancelled prefill does not run full-prompt MTP/geometry validation and is marked
+unusable. The native command loop rejects generation, save and restore until
+`QBHOTRESET` succeeds; only status/reset/shutdown remain available. A completed
+prompt still runs the original full MTP and geometry guards. This is not a switch
+that disables validation for reusable state.
+
+The adapter synchronously closes and drains Service's generator before reset or
+lease release. Active client cancellation and consumer `GeneratorExit` clear
+resident proofs and require an empty-session reset: zero live tokens, an accepted
+native guard, no live continuation, and retained weights. A failed drain/reset
+discards the backend; a subsequent request rebuilds safely. Normal decoder STOP
+is also used by reasoning-budget and tool-call continuations, so it is not by
+itself a cancelled-prefill condition. Actual client cancellation during decode is
+still reset by the adapter.
+
+Request attribution is claimed under the native transaction lock and updated
+only by its owner. A queued HTTP request records its own `http_start` without
+changing the active native request. Terminal process records retain the exiting
+process's owner instead of inheriting a later queued request. Look for
+`native_cancel_progress`, `cancel_reset_verified`, `cancel_reset_failed`,
+`cancel_backend_discarded`, and `http_cancelled`. Cancellation is not automatically
+replayed. The existing bounded audited retry for an unpublished, non-cancelled
+reuse failure remains separate.
+
+Run `python tools/test_kv_memory_cancel.py` for actual HTTP queue ownership,
+generator-drain/reset ordering and reset-failure discard tests. The native
+`kv_cancel_policy_test` checks the reset-required command boundary. Native
+`REUSED`/adapter `native_decode_ready` is a protocol marker; after a cancelled
+prefill it does not mean that decode actually ran—use the cancellation event and
+request outcome alongside it.

@@ -1,5 +1,6 @@
 #include "memory_fence.hpp"
 #include "qsa_geometry.hpp"
+#include "qsa_cancel_policy.hpp"
 #include "qsa_compact_layout.hpp"
 #include "qsa_draft_diag.hpp"
 #include "qsa_mtp_validity.hpp"
@@ -10422,6 +10423,7 @@ int main(int argc, char** argv) {
         };
         const bool memory_api_v1=std::getenv("STRATA_MEMORY_API_V1")&&std::string(std::getenv("STRATA_MEMORY_API_V1"))=="1";
         strata::memory_v1::Fence memory_fence;
+        strata::cancel_policy::Session cancel_session;
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -10443,6 +10445,14 @@ int main(int argc, char** argv) {
                     std::printf("MEMRESULT {\"version\":1,\"ok\":%s,\"epoch\":%llu,\"error\":%s,\"geometry_replay\":%s,\"mtp_active_audit\":%s,\"transaction_fence\":true}\n",reply.ok?"true":"false",(unsigned long long)reply.epoch,q(reply.error).c_str(),(qsa_proto_on&&geometry_on&&std::getenv("STRATA_QSA_V53_PREFIX_REPLAY"))?"true":"false",(qsa_proto_on&&geometry_on&&std::getenv("STRATA_QSA_V2_VALIDITY"))?"true":"false");std::fflush(stdout);continue;
                 }
                 if(reply.forward)line=std::move(reply.command);
+            }
+            if (cancel_session.reset_required) {
+                std::string operation; std::istringstream(line) >> operation;
+                if (!cancel_session.allows(operation)) {
+                    if (operation.rfind("QB",0)==0) strata::qsa_proto::wire::reject(operation,"cancelled session requires verified hot reset");
+                    else { std::printf("ERR CANCEL_RESET_REQUIRED\n"); std::fflush(stdout); }
+                    continue;
+                }
             }
             if (line.rfind("QB", 0) == 0) {
                 using namespace strata::qsa_proto;
@@ -10470,6 +10480,7 @@ int main(int argc, char** argv) {
                         qsa_fail_restore=true;wire::emit(op,"\"ok\":true,\"id\":\"transfer\"");continue;
                     }
                     if(op=="QBSTATUS"){
+                        std::printf("CANCEL_STATE reset_required=%d\n",cancel_session.reset_required?1:0);std::fflush(stdout);
                         if(args>>extra){wire::reject(op,"unexpected status argument");continue;}
                         const auto bank=bank_status();std::ostringstream f;f<<"\"ok\":true,\"live_ok\":"<<(live_ok?"true":"false")<<",\"live_count\":"<<live.size()<<",\"live_hash\":"<<wire::quote(wire::hex(wire::live_hash(live)))<<",\"live_tail\":[";
                         for(size_t i=live.size()>64?live.size()-64:0,start=i;i<live.size();++i){if(i!=start)f<<',';f<<live[i];}
@@ -10518,6 +10529,7 @@ int main(int argc, char** argv) {
                         req_imgs.clear();
                         const auto fp = guard_fingerprint(ss,g,use_mtp ? &mtp.kv_state() : nullptr,0);
                         if (!fp.ok) { wire::reject(op,"empty sequence guard failed"); return 1; }
+                        if(hot)cancel_session.reset_succeeded();
                         const double elapsed = std::chrono::duration<double,std::milli>(Clock::now()-t0).count();
                         wire::emit(op,"\"ok\":true,\"live_count\":0,\"zero_ms\":"+std::to_string(elapsed)+",\"weights_retained\":true,\"hot_discard\":"+(hot?"true":"false")+",\"host_zero_bytes\":"+std::to_string(hot_host_zero)+",\"registration_before\":"+wire::quote(wire::hex(hot_address_before))+",\"registration_after\":"+wire::quote(wire::hex(hot_address_after))+",\"guard\":"+wire::guard(fp));
                         continue;
@@ -12281,14 +12293,22 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
-            if(use_mtp){const auto missing=strata::qsa_window_diag::mtp_validity.check(qsa_v2_request+1,resume,n-1,o.mtp_window);if(missing>=0){std::printf("ERR MTP_VALIDITY_MISS resume=%lld q=%lld missing=%lld\n",(long long)resume,(long long)(n-1),(long long)missing);std::fflush(stdout);return 1;}}
-            if(geometry_on){
+            // A stopped prefill has not populated the nominal final draft window.
+            // It cannot be consumed/exported: require a verified reset, keep weights.
+            cancelled = cancelled || stop_req.load();
+            if(qsa_proto_on && cancelled) {
+                cancel_session.cancel();
+                std::printf("CANCELLED_PREFILL reached=%lld requested=%lld exact=%d reset_required=1\n",
+                    (long long)pp_reached,(long long)(n-1),pp_exact?1:0); std::fflush(stdout);
+            }
+            if(use_mtp && strata::cancel_policy::validate_complete_prefill(cancelled)){const auto missing=strata::qsa_window_diag::mtp_validity.check(qsa_v2_request+1,resume,n-1,o.mtp_window);if(missing>=0){std::printf("ERR MTP_VALIDITY_MISS resume=%lld q=%lld missing=%lld\n",(long long)resume,(long long)(n-1),(long long)missing);std::fflush(stdout);return 1;}}
+            if(geometry_on && strata::cancel_policy::validate_complete_prefill(cancelled)){
                 strata::geometry::validate(geometry_current);
                 if(geometry_input)strata::geometry::require(geometry_current==geometry_replay,"actual unit/path replay differs");
                 if(geometry_prefix_on)strata::geometry::require(strata::geometry::prefix(geometry_current,geometry_prefix.ids.size())==geometry_prefix,"actual prefix replay differs");
                 strata::geometry::write(strata::qsa_window_diag::trace_path()+".geometry.r"+std::to_string(qsa_v2_request+1)+".txt",geometry_current);
             }
-            if((strata::qsa_diagnostic_policy::full&&std::getenv("STRATA_QSA_V2_WINDOW_TRACE"))) { std::vector<int32_t> diagnostic_context(ids.begin(),ids.end()-1); strata::qsa_window_diag::state_point("prefill",qsa_v2_request+1,n-1,0,ss,g,use_mtp?&mtp.kv_state():nullptr,host_res,&diagnostic_context); if(use_mtp)strata::qsa_window_diag::draft_point("prefill",qsa_v2_request+1,n-1,n-1,mtp.kv_state(),g,o.mtp_window,mtp.first_needed(),diagnostic_context); }
+            if(!cancelled && (strata::qsa_diagnostic_policy::full&&std::getenv("STRATA_QSA_V2_WINDOW_TRACE"))) { std::vector<int32_t> diagnostic_context(ids.begin(),ids.end()-1); strata::qsa_window_diag::state_point("prefill",qsa_v2_request+1,n-1,0,ss,g,use_mtp?&mtp.kv_state():nullptr,host_res,&diagnostic_context); if(use_mtp)strata::qsa_window_diag::draft_point("prefill",qsa_v2_request+1,n-1,n-1,mtp.kv_state(),g,o.mtp_window,mtp.first_needed(),diagnostic_context); }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
@@ -13328,6 +13348,10 @@ int main(int argc, char** argv) {
                 live_ok = true;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
+            }
+            if(qsa_proto_on && cancelled) {
+                cancel_session.cancel(); live_ok=false; live.clear(); live_imgs.clear();
+                checks.clear(); tail_ckpt_len=-1; conversations.clear();
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
